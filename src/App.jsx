@@ -4,9 +4,58 @@ import Dashboard from './views/Dashboard';
 import Intake from './views/Intake';
 import Clinical from './views/Clinical';
 import Appointments from './views/Appointments';
+import AppointmentsCalendar from './views/AppointmentsCalendar';
+import Messages from './views/Messages';
 import Patients from './views/Patients';
 import PatientDetail from './views/PatientDetail';
-import { fetchList, saveIntake, saveClinical, uploadQr, getCachedList, fetchOrg, getRxTemplateUrl, generatePrescriptionPdf, updatePatient } from './api';
+import { fetchList, saveIntake, saveClinical, uploadQr, getCachedList, fetchOrg, getRxTemplateUrl, generatePrescriptionPdf, updatePatient, logEvent } from './api';
+import { WaProvider, useWa } from './whatsapp/WaContext';
+import { upsertAppointment, cancelAppointment } from './whatsapp/waApi';
+import { useIsPhone } from './whatsapp/ui';
+
+// The old Appointments list and the new calendar are two components, not one
+// component with a flag inside it. A clinic that is not part of the WhatsApp
+// rollout renders exactly the code it rendered yesterday.
+function AppointmentsSwitch({ legacy, onOpenVisit }) {
+  const wa = useWa();
+  if (!wa.ready) return null;
+  return wa.enabled ? <AppointmentsCalendar onOpenVisit={onOpenVisit} /> : <Appointments {...legacy} />;
+}
+
+// The floating "New Visit" button.
+//
+// It used to hide on the appointments tab only when `showApptCal` was set —
+// but that flag belongs to the LEGACY appointments view. A clinic with
+// WhatsApp on renders AppointmentsCalendar instead and never sets it, so the
+// button stayed, floating over the calendar. On a phone it covers the grid
+// outright, which is where it was reported.
+//
+// Lives in its own component because useWa() cannot be called by App, which
+// is what renders the provider.
+function NewVisitFab({ view, showApptCal, onClick }) {
+  const wa = useWa();
+  const isPhone = useIsPhone();
+  if (view !== 'dashboard' && view !== 'appointments' && view !== 'patients') return null;
+  if (view === 'appointments' && (showApptCal || (wa.enabled && isPhone))) return null;
+  return (
+    <button
+      onClick={onClick}
+      title="New visit"
+      aria-label="New visit"
+      style={{
+        position: 'fixed', right: 22, bottom: 22, zIndex: 70, height: 58, padding: '0 24px',
+        border: 0, borderRadius: 100, background: '#ef5a3c', color: '#fff', fontWeight: 700,
+        fontSize: 15.5, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9,
+        boxShadow: '0 14px 30px -8px rgba(239,90,60,.55)',
+      }}
+    >
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.4" strokeLinecap="round">
+        <path d="M12 5v14M5 12h14" />
+      </svg>
+      New Visit
+    </button>
+  );
+}
 
 function today() {
   const d = new Date();
@@ -134,6 +183,7 @@ export default function App({ user, onLogout }) {
   const [showQr, setShowQr] = useState(false);
   const [clinicalReadOnly, setClinicalReadOnly] = useState(false);
   const [org, setOrg] = useState(null);
+  const [orgLoaded, setOrgLoaded] = useState(false);
   const [rxTemplateUrl, setRxTemplateUrl] = useState(null);
 
   function applySnapshot(res) {
@@ -197,6 +247,48 @@ export default function App({ user, onLogout }) {
     return res;
   }
 
+  // The appointment is mirrored into DynamoDB after the Sheet write succeeds.
+  //
+  // The Sheet stays the record of the visit; DynamoDB becomes the record of
+  // the appointment, because that is what the reminder scheduler reads, what
+  // reschedule and cancel update, and what has to be authoritative when a
+  // slot is given away. The mirror is deliberately after the save and
+  // deliberately swallowed: a failed mirror must never make a doctor think
+  // their clinical notes were lost.
+  function syncAppointment(saveForm) {
+    if (!org || !org.waEnabled) return;
+    const p = db && db.patients && db.patients[curPatientId];
+    if (!p) return;
+
+    // The doctor cleared the next appointment. That has to cancel the
+    // mirrored row, not just skip it — otherwise the slot stays SCHEDULED
+    // in DynamoDB and the scheduler reminds the patient about a visit that
+    // is no longer happening, which is worse than never having sent one.
+    //
+    // A 404 is the ordinary case: this visit never had an appointment.
+    if (!saveForm.nextAppointment) {
+      cancelAppointment({ appointmentId: curVisitId }).catch((err) => {
+        if (/not found/i.test(String((err && err.message) || ''))) return;
+        logEvent({ kind: 'wa_request', op: 'cancelAppointment', outcome: 'api_error',
+          serverError: String((err && err.message) || ''), visitId: curVisitId });
+      });
+      return;
+    }
+    const tr = Array.isArray(saveForm.treatment) ? saveForm.treatment.join(', ') : (saveForm.treatment || '');
+    upsertAppointment({
+      patientId: curPatientId,
+      visitId: curVisitId,
+      name: p.name,
+      mobile: p.mobile,
+      date: saveForm.nextAppointment,
+      time: saveForm.nextAppointmentTime || '',
+      treatment: tr || saveForm.treatmentOther || '',
+    }).catch((err) => {
+      logEvent({ kind: 'wa_request', op: 'upsertAppointment', outcome: 'api_error',
+        serverError: String((err && err.message) || ''), visitId: curVisitId });
+    });
+  }
+
   async function loadList(isRefresh) {
     if (isRefresh) setRefreshing(true); else setLoading(true);
     try {
@@ -224,7 +316,10 @@ export default function App({ user, onLogout }) {
       if (o?.rxTemplateKey && !o.rxTemplateKey.endsWith('.docx')) {
         getRxTemplateUrl().then(u => { if (u) setRxTemplateUrl(u); });
       }
-    });
+    // fetchOrg swallows its own errors and resolves null, so this fires
+    // either way — the WhatsApp provider must not wait forever on a clinic
+    // whose org record failed to load.
+    }).finally(() => setOrgLoaded(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -269,6 +364,9 @@ export default function App({ user, onLogout }) {
   }
   function goPatients() {
     pushView('patients');
+  }
+  function goMessages() {
+    pushView('messages');
   }
   function openPatientDetail(pid) {
     setDetailPid(pid);
@@ -322,7 +420,10 @@ export default function App({ user, onLogout }) {
   async function startVisitForExisting(pid) {
     const p = db.patients[pid];
     if (!p) return;
-    const intakeData = { mobile: p.mobile, name: p.name, age: p.age, gender: p.gender, address: p.address || '', date: today() };
+    // patientId is explicit: this is a new visit for a patient the user
+    // picked by name, and on a shared family number the server cannot
+    // work that out from the mobile alone.
+    const intakeData = { mobile: p.mobile, name: p.name, age: p.age, gender: p.gender, address: p.address || '', date: today(), patientId: pid };
     const optNo = p.visits.length + 1;
     const optVid = pid + '_' + optNo;
     const optVisit = { visitId: optVid, no: optNo, date: today(), done: false, clinical: null, createdAt: new Date().toISOString() };
@@ -368,9 +469,18 @@ export default function App({ user, onLogout }) {
     }
     setIntakeError('');
 
-    const intakeData = { mobile: mm, name: form.name.trim(), age: form.age, gender: form.gender, address: (form.address || '').trim(), date: form.date };
     const allOnMobile = findAllByMobile(db, mm);
     const existingP = addAnother ? null : allOnMobile.find((p) => p.name.toLowerCase() === form.name.trim().toLowerCase());
+    // The screen already knows whether this is a returning patient, which one,
+    // or a new person on a number someone else already uses. Telling the
+    // server is what makes the second patient on a family phone a second
+    // record rather than an edit of the first.
+    const intakeData = {
+      mobile: mm, name: form.name.trim(), age: form.age, gender: form.gender,
+      address: (form.address || '').trim(), date: form.date,
+      patientId: existingP ? existingP.patientId : '',
+      newPatient: !existingP,
+    };
     const optPid = existingP ? existingP.patientId : 'P' + String(db.seq + 1).padStart(4, '0');
     const optNo = existingP ? existingP.visits.length + 1 : 1;
     const optVid = optPid + '_' + optNo;
@@ -455,6 +565,7 @@ export default function App({ user, onLogout }) {
       const res = await saveClinical({ patientId: curPatientId, visitId: curVisitId, cform: saveForm });
       if (res.patients) applySnapshot(res);
       else applyClinicalLocally(curPatientId, curVisitId, saveForm, res);
+      syncAppointment(saveForm);
     } catch (err) {
       setClinicalError(errText(err, 'Auto-save failed — your data is still in the form.'));
     } finally {
@@ -478,6 +589,7 @@ export default function App({ user, onLogout }) {
       const res = await saveClinical({ patientId: curPatientId, visitId: curVisitId, cform: saveForm });
       if (res.patients) applySnapshot(res);
       else applyClinicalLocally(curPatientId, curVisitId, saveForm, res);
+      syncAppointment(saveForm);
       setSavedFlash(true);
       setTimeout(() => {
         setSavedFlash(false);
@@ -753,8 +865,9 @@ export default function App({ user, onLogout }) {
       : apptCount + ' appointments already booked on this day.';
 
   return (
+    <WaProvider org={org} orgLoaded={orgLoaded}>
     <div style={{ minHeight: '100vh' }}>
-      <Header view={view} onGoDash={goDash} onGoAppts={goAppts} onGoPatients={goPatients} user={user} onLogout={onLogout} />
+      <Header view={view} onGoDash={goDash} onGoAppts={goAppts} onGoPatients={goPatients} onGoMessages={goMessages} user={user} onLogout={onLogout} />
       <main style={{ maxWidth: 1180, margin: '0 auto', padding: '26px 22px 60px' }}>
         {loadError && (
           <p style={{ color: '#c0392b', fontSize: 13, fontWeight: 600, marginBottom: 12 }}>{loadError}</p>
@@ -771,14 +884,19 @@ export default function App({ user, onLogout }) {
         )}
 
         {view === 'appointments' && (
-          <Appointments
-            appts={appts} hasAppts={appts.length > 0} noAppts={appts.length === 0}
-            apptDate={apptDate} onSetApptDate={setApptDate}
-            onApptToday={() => setApptDate(today())} apptDateLabel={apptDateLabel}
-            apptDatesMap={apptDatesMap}
-            showCal={showApptCal} onSetShowCal={setShowApptCal}
+          <AppointmentsSwitch
+            onOpenVisit={(pid, visitId) => openVisit(pid, visitId, true)}
+            legacy={{
+              appts, hasAppts: appts.length > 0, noAppts: appts.length === 0,
+              apptDate, onSetApptDate: setApptDate,
+              onApptToday: () => setApptDate(today()), apptDateLabel,
+              apptDatesMap,
+              showCal: showApptCal, onSetShowCal: setShowApptCal,
+            }}
           />
         )}
+
+        {view === 'messages' && <Messages />}
 
         {view === 'patients' && (
           <Patients
@@ -846,24 +964,7 @@ export default function App({ user, onLogout }) {
         )}
       </main>
 
-      {(view === 'dashboard' || view === 'appointments' || view === 'patients') && !(view === 'appointments' && showApptCal) && (
-        <button
-          onClick={goIntake}
-          title="New visit"
-          aria-label="New visit"
-          style={{
-            position: 'fixed', right: 22, bottom: 22, zIndex: 70, height: 58, padding: '0 24px',
-            border: 0, borderRadius: 100, background: '#ef5a3c', color: '#fff', fontWeight: 700,
-            fontSize: 15.5, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9,
-            boxShadow: '0 14px 30px -8px rgba(239,90,60,.55)',
-          }}
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.4" strokeLinecap="round">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          New Visit
-        </button>
-      )}
+      <NewVisitFab view={view} showApptCal={showApptCal} onClick={goIntake} />
 
       {(savingIntake || savingClinical) && (
         <div style={{
@@ -883,5 +984,6 @@ export default function App({ user, onLogout }) {
         </div>
       )}
     </div>
+    </WaProvider>
   );
 }
